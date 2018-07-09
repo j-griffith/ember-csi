@@ -12,6 +12,7 @@ import os
 import socket
 import stat
 import sys
+import threading
 import time
 import traceback
 
@@ -155,6 +156,37 @@ def require(*fields):
             return f(self, request, context)
         return checker
     return func_wrapper
+
+
+class Worker(object):
+    current_workers = {}
+
+    @classmethod
+    def _unique_worker(cls, func, request_field):
+        @functools.wraps(func)
+        def wrapper(self, request, context):
+            worker_id = getattr(request, request_field)
+            my_method = func.__name__
+            my_thread = threading.current_thread().ident
+            method, thread = cls.current_workers.setdefault(
+                worker_id, (my_method, my_thread))
+            if (method, thread) != (my_method, my_thread):
+                context.abort(grpc.StatusCode.ABORTED,
+                              'Cannot do %s while thread %s is doing %s' %
+                              (my_method, thread, method))
+            try:
+                return func(self, request, context)
+            finally:
+                del cls.current_workers[worker_id]
+        return wrapper
+
+    @classmethod
+    def unique(cls, *args):
+        if len(args) == 1 and callable(args[0]):
+            return cls._unique_worker(args[0], 'volume_id')
+        else:
+            return functools.partial(cls._unique_worker_trace,
+                                     request_field=args[0])
 
 
 class NodeInfo(object):
@@ -444,6 +476,7 @@ class Controller(csi.ControllerServicer, Identity):
     @debuggable
     @logrpc
     @require('volume_id')
+    @Worker.unique
     def DeleteVolume(self, request, context):
         vol = self._get_vol(request.volume_id)
         if not vol:
@@ -763,6 +796,7 @@ class Node(csi.NodeServicer, Identity):
     @debuggable
     @logrpc
     @require('volume_id', 'staging_target_path', 'volume_capability')
+    @Worker.unique
     def NodeStageVolume(self, request, context):
         vol = self._get_vol(request.volume_id)
         if not vol:
